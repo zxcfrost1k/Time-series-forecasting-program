@@ -1,0 +1,584 @@
+---
+title: "Курсовая работа"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+params:
+  csv_file: "dinamika-tsen.csv"
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(forecast)
+library(zoo)
+library(modeest)
+library(tseries)
+library(lubridate)
+library(Metrics)
+library(tidyr)
+```
+
+# КУРСОВАЯ РАБОТА
+
+# Прогнозирование временного ряда на основе линейных авторегрессионных моделей о стоимости недвижимости
+
+## Загрузка и подготовка данных
+```{r}
+df <- read.csv2(params$csv_file)
+
+df$period <- as.Date(df$period)
+df$value <- as.numeric(df$value)
+df$period <- as.Date(df$period)
+df$year <- format(df$period, "%Y")
+```
+
+В качестве исходных данных использован набор наблюдений, содержащий информацию о динамике цен на жильё за различные периоды времени.
+
+На этапе подготовки данных были выполнены:
+
+- загрузка данных из CSV-файла;
+- преобразование типов данных.
+
+## Параметры датасета
+
+Количество строк: `r nrow(df)`
+
+Количкство столбцов: `r ncol(df)`
+
+Общее количество ячеек: `r nrow(df) * ncol(df)`
+
+## Визуальный анализ данных
+
+### Гистограмма
+
+Гистограмма используется для анализа распределения значений временного ряда и позволяет определить характер распределения данных, наличие асимметрии и возможных выбросов.
+
+```{r}
+ggplot(df, aes(x = value)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(title = "Распределение цен на жилье",
+    subtitle = "Все регионы, все периоды (2022–2026)",
+    x = "Цена (руб./кв.м)",
+    y = "Количество наблюдений") +
+  theme_minimal() +
+  scale_x_continuous(labels = scales::comma)
+```
+
+
+### Столбчатая диаграмма
+
+```{r}
+yearly_avg <- df %>%
+  group_by(year, price_type) %>%
+  summarise(avg_price = mean(value, na.rm = TRUE), .groups = "drop")
+
+ggplot(yearly_avg, aes(x = year, y = avg_price, fill = price_type)) +
+  geom_col(position = "dodge") +
+  labs(title = "Средние цены на жилье по годам",
+       x = "Год",
+       y = "Средняя цена (руб./кв.м)",
+       fill = "Тип рынка") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma)
+```
+
+### Боксплот
+
+Боксплот применяется для анализа разброса данных и выявления аномальных наблюдений.
+
+```{r}
+moscow_data <- df %>%
+  filter(ref_area == "Москва")
+
+ggplot(moscow_data, aes(x = price_type, y = value, fill = price_type)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Распределение цен на жилье в Москве",
+    subtitle = "2022–2026",
+    x = "Тип рынка",
+    y = "Цена (руб./кв.м)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+## Корреляционный анализ
+
+### Автокорреляционная функция (ACF)
+
+Автокорреляционная функция позволяет определить степень зависимости текущих значений временного ряда от его предыдущих значений.
+
+```{r}
+# Фильтрация данных для вторичного рынка Москвы
+moscow_secondary <- df %>%
+  filter(ref_area == "Москва", price_type == "Вторичный рынок") %>%
+  arrange(period)
+
+# Преобразование в ts-объект (частота = 12 для месячных данных)
+prices_ts <- ts(moscow_secondary$value, start = c(2022, 1), frequency = 12)
+
+# Расчёт и визуализация ACF
+ggAcf(prices_ts, lag.max = 24, main = "Автокорреляционная функция (ACF) для цен на жилье в Москве") +
+  theme_minimal()
+```
+
+### Взаимная корреляция
+
+```{r}
+# Формирование широкого формата данных
+prices_wide <- df %>%
+  filter(price_type == "Вторичный рынок") %>%
+  select(period, ref_area, value) %>%
+  pivot_wider(names_from = ref_area, values_from = value)
+
+# Расчёт корреляции между Москвой и Санкт-Петербургом
+cor_moscow_spb <- cor(prices_wide$Москва, prices_wide$`Санкт-Петербург`,
+                      method = "pearson", use = "complete.obs")
+print(paste("Корреляция цен Москва — Санкт-Петербург:", round(cor_moscow_spb, 3)))
+```
+
+## Коэффициент корреляции Спирмена
+
+```{r}
+# Создание порядкового номера периода
+df$period_num <- as.numeric(as.Date(df$period))
+
+# Расчёт корреляции Спирмена (для всех данных в целом)
+spearman_time <- cor(df$value, df$period_num, method = "spearman")
+print(paste("Корреляция Спирмена (цена — время):", round(spearman_time, 3)))
+```
+
+## Выявление выбросов и трендов
+
+### Выявление выбросов методом межквартильного размаха
+
+Метод IQR: все данные
+
+```{r}
+cat("1. МЕТОД IQR: ВСЕ ДАННЫЕ\n\n")
+
+Q1_all <- quantile(df$value, 0.25, na.rm = TRUE)
+Q3_all <- quantile(df$value, 0.75, na.rm = TRUE)
+IQR_all <- Q3_all - Q1_all
+
+lower_bound_all <- Q1_all - 1.5 * IQR_all
+upper_bound_all <- Q3_all + 1.5 * IQR_all
+
+outliers_iqr_all <- df %>%
+  filter(value < lower_bound_all | value > upper_bound_all)
+
+cat("Q1 =", round(Q1_all, 2), "\n")
+cat("Q3 =", round(Q3_all, 2), "\n")
+cat("IQR =", round(IQR_all, 2), "\n")
+cat("Нижняя граница:", round(lower_bound_all, 2), "\n")
+cat("Верхняя граница:", round(upper_bound_all, 2), "\n")
+cat("Количество выбросов:", nrow(outliers_iqr_all),
+    "из", nrow(df), sprintf("(%.2f%%)", 100 * nrow(outliers_iqr_all) / nrow(df)), "\n")
+```
+
+Метод IQR: По сегментам рынка
+
+```{r}
+cat("2. МЕТОД IQR: ПО СЕГМЕНТАМ РЫНКА\n")
+
+for(market in c("Первичный рынок", "Вторичный рынок")) {
+  data_market <- df %>% filter(price_type == market)
+  Q1_m <- quantile(data_market$value, 0.25, na.rm = TRUE)
+  Q3_m <- quantile(data_market$value, 0.75, na.rm = TRUE)
+  IQR_m <- Q3_m - Q1_m
+  lower_m <- Q1_m - 1.5 * IQR_m
+  upper_m <- Q3_m + 1.5 * IQR_m
+  outliers_m <- data_market %>% filter(value < lower_m | value > upper_m)
+
+  cat("\nРынок:", market, "\n")
+  cat("  Q1 =", round(Q1_m, 2), "\n")
+  cat("  Q3 =", round(Q3_m, 2), "\n")
+  cat("  Границы: [", round(lower_m, 2), ";", round(upper_m, 2), "]\n")
+  cat("  Выбросов:", nrow(outliers_m), "из", nrow(data_market),
+      sprintf("(%.2f%%)", 100 * nrow(outliers_m) / nrow(data_market)), "\n")
+}
+```
+
+### Выявление трендов
+
+Анализ трендов
+
+```{r}
+cat("1. АНАЛИЗ ТРЕНДА СРЕДНИХ ЦЕН\n\n")
+
+# Агрегация по месяцам
+monthly_avg <- df %>%
+  mutate(year_month = format(period, "%Y-%m")) %>%
+  group_by(year_month, price_type) %>%
+  summarise(avg_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(period_date = as.Date(paste0(year_month, "-01")))
+
+# Линейная регрессия для общего тренда
+monthly_avg_total <- df %>%
+  mutate(year_month = format(period, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(avg_value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(period_date = as.Date(paste0(year_month, "-01")))
+
+monthly_avg_total$period_num <- as.numeric(monthly_avg_total$period_date)
+model_trend <- lm(avg_value ~ period_num, data = monthly_avg_total)
+
+cat("Коэффициент тренда (среднемесячный):", round(coef(model_trend)[2], 2), "руб./мес\n")
+cat("Коэффициент тренда (за год):", round(coef(model_trend)[2] * 12, 2), "руб./год\n")
+cat("p-value тренда:", format(summary(model_trend)$coefficients[2,4], scientific = TRUE), "\n")
+cat("R-squared:", round(summary(model_trend)$r.squared, 4), "\n\n")
+```
+
+Скользяцее среднее 12 месяцев
+
+```{r}
+cat("2. СКОЛЬЗЯЩЕЕ СРЕДНЕЕ (12 МЕСЯЦЕВ)\n\n")
+
+df_sorted <- df %>%
+  arrange(period) %>%
+  group_by(period) %>%
+  summarise(daily_avg = mean(value, na.rm = TRUE), .groups = "drop")
+
+df_sorted$ma_12 <- rollmean(df_sorted$daily_avg, k = 12, fill = NA, align = "right")
+
+cat("Скользящее среднее за 12 месяцев рассчитано.\n")
+cat("Последние 6 значений:\n")
+print(tail(df_sorted[, c("period", "daily_avg", "ma_12")], 6))
+```
+
+Сравнение трендов по типам рынка
+
+```{r}
+# Сравнение трендов по типам рынка
+ggplot(monthly_avg, aes(x = period_date, y = avg_value, color = price_type)) +
+  geom_line(linewidth = 1) +
+  geom_smooth(method = "lm", se = TRUE, linetype = "dashed", linewidth = 0.8) +
+  labs(title = "Сравнение трендов: первичный vs. вторичный рынок",
+       subtitle = "Сплошные линии — фактические данные, пунктирные — линейные тренды",
+       x = "Дата", y = "Средняя цена (руб./кв.м)",
+       color = "Тип рынка") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::comma)
+```
+
+## Применение метод статичтического анализа
+
+### Описательная статистика
+
+```{r}
+summary(df$value)
+# Расчёт моды
+mode_value <- mfv(df$value)
+print(paste("Мода:", mode_value))
+# Дисперсия и стандартное отклонение
+variance <- var(df$value)
+std_dev <- sd(df$value)
+print(paste("Дисперсия:", variance))
+print(paste("Стандартное отклонение:", std_dev))
+```
+
+### Проверка гипотез
+
+```{r}
+t.test(value ~ ref_area, data = subset(df, ref_area %in% c("Москва", "Санкт-Петербург") & price_type == "Вторичный рынок"), var.equal = TRUE)
+
+wilcox.test(value ~ ref_area, data = subset(df, ref_area %in% c("Москва", "Санкт-Петербург") & price_type == "Вторичный рынок"))
+```
+
+### Регрессионный анализ
+
+Проверка стационарности
+
+```{r}
+# Агрегация средних цен по месяцам
+monthly_avg <- df %>%
+  mutate(year_month = format(period, "%Y-%m")) %>%
+  group_by(year_month) %>%
+  summarise(avg_price = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(period_date = as.Date(paste0(year_month, "-01"))) %>%
+  arrange(period_date)
+
+# Создание ts-объекта (частота 12 для месячных данных)
+prices_ts <- ts(monthly_avg$avg_price, start = c(2022, 1), frequency = 12)
+
+# ADF-тест
+adf_result <- adf.test(prices_ts, alternative = "stationary")
+print(adf_result)
+```
+
+Приведение к стационарности
+
+Первая разность
+
+```{r}
+prices_diff <- diff(prices_ts, differences = 1)
+adf_diff <- adf.test(prices_diff, alternative = "stationary")
+print(adf_diff)
+```
+
+Вторая разность
+
+```{r}
+prices_diff2 <- diff(prices_ts, differences = 2)
+adf_diff2 <- adf.test(na.omit(prices_diff2), alternative = "stationary")
+print(adf_diff2)
+```
+
+Выбор модели
+
+```{r}
+d <- 2  # Вторая разность стационарна
+stationary_series <- na.omit(prices_diff2)
+
+# Построение графиков
+par(mfrow = c(1, 2), mar = c(4, 4, 3, 2))
+acf(stationary_series, lag.max = 20,
+    main = paste0("ACF (вторая разность, d = ", d, ")"),
+    ylab = "Автокорреляция")
+pacf(stationary_series, lag.max = 20,
+     main = paste0("PACF (вторая разность, d = ", d, ")"),
+     ylab = "Частная автокорреляция")
+
+# Определение порядка p по PACF
+sig_level <- 1.96 / sqrt(length(stationary_series))
+pacf_values <- pacf(stationary_series, lag.max = 20, plot = FALSE)
+significant_lags <- which(abs(pacf_values$acf[,,1]) > sig_level)
+
+cat("АНАЛИЗ PACF:\n")
+if(length(significant_lags) > 0) {
+  cat(sprintf("   Значимые лаги в PACF: %s\n", paste(significant_lags, collapse = ", ")))
+  p_recommended <- significant_lags[1]
+  cat(sprintf("   РЕКОМЕНДУЕМЫЙ ПОРЯДОК p = %d\n", p_recommended))
+} else {
+  cat("   Нет значимых лагов → p = 0\n")
+  p_recommended <- 0
+}
+
+# Определение порядка q по ACF
+acf_values <- acf(stationary_series, lag.max = 20, plot = FALSE)
+significant_lags_ma <- which(abs(acf_values$acf[,,1]) > sig_level)
+significant_lags_ma <- significant_lags_ma[significant_lags_ma > 1]
+
+cat("\nАНАЛИЗ ACF:\n")
+if(length(significant_lags_ma) > 0) {
+  cat(sprintf("   Значимые лаги в ACF: %s\n", paste(significant_lags_ma, collapse = ", ")))
+  q_recommended <- significant_lags_ma[1]
+  cat(sprintf("   РЕКОМЕНДУЕМЫЙ ПОРЯДОК q = %d\n", q_recommended))
+} else {
+  cat("   Нет значимых лагов → q = 0\n")
+  q_recommended <- 0
+}
+```
+
+Итоговая модель
+
+```{r}
+cat("ИТОГОВАЯ РЕКОМЕНДУЕМАЯ МОДЕЛЬ\n")
+cat(sprintf("\n   МОДЕЛЬ: ARIMA(%d, %d, %d)\n", p_recommended, d, q_recommended))
+cat("\n")
+```
+
+### Анализ сезонности
+
+```{r}
+# STL-декомпозиция
+decomposed <- stl(prices_ts, s.window = "periodic")
+
+# Визуализация декомпозиции
+par(mfrow = c(4, 1), mar = c(3, 4, 2, 2))
+plot(decomposed, main = "STL-декомпозиция временного ряда")
+
+# Расчёт сезонных индексов
+monthly_avg$month_num <- month(monthly_avg$period_date)
+
+seasonal_indices <- monthly_avg %>%
+  group_by(month_num) %>%
+  summarise(mean_price = mean(avg_price, na.rm = TRUE), .groups = "drop")
+
+overall_mean <- mean(monthly_avg$avg_price)
+seasonal_indices$index <- seasonal_indices$mean_price / overall_mean
+
+cat("СЕЗОННЫЕ ИНДЕКСЫ (нормированные):\n")
+for(i in 1:12) {
+  cat(sprintf("   %s: %.3f\n",
+      month.name[i], seasonal_indices$index[seasonal_indices$month_num == i]))
+}
+
+# Оценка силы сезонности
+seasonal_variance <- var(decomposed$time.series[, "seasonal"])
+remainder_variance <- var(decomposed$time.series[, "remainder"])
+seasonal_strength <- 1 - (remainder_variance / (seasonal_variance + remainder_variance))
+
+cat("\nОЦЕНКА СИЛЫ СЕЗОННОСТИ:\n")
+cat(sprintf("   Относительная сила сезонности: %.1f%%\n", seasonal_strength * 100))
+if(seasonal_strength < 0.3) {
+  cat("   Вывод: сезонная компонента выражена слабо\n")
+  cat("   При прогнозировании сезонность можно не учитывать\n")
+}
+```
+
+### Разделение на тестовую и обучающую выборки
+
+```{r}
+train_ts <- window(prices_ts, end = c(2025, 7))
+test_ts <- window(prices_ts, start = c(2025, 8))
+
+cat("РАЗДЕЛЕНИЕ НА ОБУЧАЮЩУЮ И ТЕСТОВУЮ ВЫБОРКИ:\n\n")
+cat(sprintf("Обучающая выборка: январь 2022 г. — июль 2025 г. (%d месяцев, %.1f%% данных)\n",
+    length(train_ts), length(train_ts)/length(prices_ts)*100))
+cat(sprintf("Тестовая выборка: август 2025 г. — январь 2026 г. (%d месяцев, %.1f%% данных)\n",
+    length(test_ts), length(test_ts)/length(prices_ts)*100))
+
+# Визуализация разделения
+train_df <- data.frame(
+  date = monthly_avg$period_date[1:length(train_ts)],
+  price = as.numeric(train_ts),
+  type = "Обучающая"
+)
+
+test_df <- data.frame(
+  date = monthly_avg$period_date[(length(train_ts)+1):nrow(monthly_avg)],
+  price = as.numeric(test_ts),
+  type = "Тестовая"
+)
+
+rbind(train_df, test_df) %>%
+  ggplot(aes(x = date, y = price, color = type)) +
+  geom_line(size = 0.8) +
+  geom_vline(xintercept = as.numeric(monthly_avg$period_date[length(train_ts)]),
+             linetype = "dashed", color = "red") +
+  labs(title = "Разделение данных на обучающую и тестовую выборки",
+       x = "Дата", y = "Цена (руб./кв.м)", color = "Выборка") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Построение авторегрессионной модели
+
+```{r}
+# Построение модели на обучающей выборке
+model_arima <- Arima(train_ts, order = c(1, 2, 2))
+summary(model_arima)
+
+# Диагностика остатков
+cat("\nДИАГНОСТИКА ОСТАТКОВ:\n")
+checkresiduals(model_arima)
+
+# Тест Льюнга-Бокса
+lb_test <- Box.test(residuals(model_arima), type = "Ljung-Box", lag = 10)
+cat(sprintf("\nТест Льюнга-Бокса: Q(10) = %.4f, p-value = %.4f\n",
+    lb_test$statistic, lb_test$p.value))
+if(lb_test$p.value > 0.05) {
+  cat("   Вывод: остатки некоррелированы (условие выполнено)\n")
+}
+```
+
+Оценка качества прогноза
+
+```{r}
+horizon_test <- length(test_ts)
+forecast_test <- forecast(model_arima, h = horizon_test)
+
+actual_test <- as.numeric(test_ts)
+predicted_test <- as.numeric(forecast_test$mean)
+
+rmse_val <- rmse(actual_test, predicted_test)
+mae_val <- mae(actual_test, predicted_test)
+mape_val <- mape(actual_test, predicted_test) * 100
+
+cat(sprintf("RMSE = %.2f\n", rmse_val))
+cat(sprintf("MAE  = %.2f\n", mae_val))
+cat(sprintf("MAPE = %.2f%%\n", mape_val))
+```
+
+```{r}
+horizon_test <- length(test_ts)
+forecast_test <- forecast(model_arima, h = horizon_test)
+
+# Фактические значения (из тестовой выборки)
+actual_test <- as.numeric(test_ts)
+
+# Прогнозные значения (из модели)
+predicted_test <- as.numeric(forecast_test$mean)
+
+errors <- actual_test - predicted_test
+abs_percent_errors <- abs(errors / actual_test) * 100
+
+# Создаём вектор дат для тестовой выборки
+last_train_date <- monthly_avg$period_date[length(train_ts)]
+test_dates <- seq(last_train_date + months(1),
+                  by = "month",
+                  length.out = horizon_test)
+
+comparison_df <- data.frame(
+  Месяц = 1:horizon_test,
+  Дата = format(test_dates, "%B %Y"),
+  Факт = round(actual_test, 0),
+  Прогноз = round(predicted_test, 0),
+  Ошибка = round(errors, 0),
+  Ошибка_процент = round(abs_percent_errors, 2)
+)
+
+print(comparison_df)
+```
+
+### Прогноз
+
+```{r}
+horizon_future <- 12
+forecast_future <- forecast(model_arima, h = horizon_future, level = c(80, 95))
+
+# Даты прогноза
+last_date <- monthly_avg$period_date[nrow(monthly_avg)]
+future_dates <- seq(last_date + months(1), by = "month", length.out = horizon_future)
+
+# Таблица прогноза
+forecast_table <- data.frame(
+  Месяц = 1:horizon_future,
+  Дата = format(future_dates, "%B %Y"),
+  Прогноз = round(as.numeric(forecast_future$mean), 0),
+  Нижний_80 = round(as.numeric(forecast_future$lower[, 1]), 0),
+  Верхний_80 = round(as.numeric(forecast_future$upper[, 1]), 0),
+  Нижний_95 = round(as.numeric(forecast_future$lower[, 2]), 0),
+  Верхний_95 = round(as.numeric(forecast_future$upper[, 2]), 0)
+)
+
+# Вывод таблицы
+print(forecast_table)
+```
+
+Расчет показателей
+
+```{r}
+# Расчёт показателей
+
+forecast_mean <- c(131717, 132457, 133422, 134207, 135136, 135950,
+                   136856, 137688, 138580, 139424, 140306, 141157)
+
+# Прогнозируемый рост за 12 месяцев
+growth_rate <- (forecast_mean[12] / forecast_mean[1] - 1) * 100
+
+# Среднемесячный прирост
+avg_monthly_growth <- mean(diff(forecast_mean))
+
+# Средняя ширина доверительных интервалов
+ci95_width <- c(133620-129815, 136363-128552, 140055-126790, 143819-124595,
+                 148193-122080, 152698-119202, 157650-116063, 162762-112615,
+                 168226-108934, 173865-104983, 179794-100818, 185902-96412)
+avg_ci95_width <- mean(ci95_width)
+
+cat(sprintf("Прогнозируемый рост за 12 месяцев: %.2f%%\n", growth_rate))
+cat(sprintf("Среднемесячный прирост: %.0f руб./кв.м\n", avg_monthly_growth))
+cat(sprintf("Средняя ширина 95%% доверительного интервала: %.0f руб./кв.м\n", avg_ci95_width))
+```
+
+График прогноза стоимости недвижимости на 12 месяцев
+
+```{r}
+autoplot(forecast_future) +
+  labs(title = "Прогноз стоимости недвижимости на 12 месяцев",
+       subtitle = paste0("Модель ARIMA(1,2,2), MAPE = 2.38%, RMSE = 4232 руб./кв.м"),
+       y = "Цена (руб./кв.м)", x = "Время") +
+  theme_minimal()
+```
